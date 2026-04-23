@@ -1,4 +1,4 @@
-# PR Comments to Copilot
+# Comments Autofixer
 
 Fetches active review comments from an **Azure DevOps Pull Request** and sends each one to the **GitHub Copilot CLI** to apply fixes automatically. After each successful fix the corresponding PR thread is marked as *fixed* via the Azure DevOps REST API.
 
