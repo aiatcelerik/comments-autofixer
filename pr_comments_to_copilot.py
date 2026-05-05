@@ -88,6 +88,68 @@ def check_dependencies() -> None:
         sys.exit(1)
 
 
+_COPILOT_AUTH_ERROR_PATTERNS = (
+    "no authentication information found",
+    "not logged in",
+    "not authenticated",
+    "unauthenticated",
+    "unauthorized",
+    "please log in",
+    "login required",
+    "authentication required",
+    "sign in",
+)
+
+
+def check_copilot_login() -> None:
+    """Verify the Copilot CLI is authenticated before processing any comments.
+
+    Runs a minimal probe invocation (``copilot --no-ask-user -p ...``) and
+    inspects the exit code and output for authentication errors.  Exits with a
+    descriptive message so that comments are never marked as resolved without
+    Copilot having actually run.
+    """
+    probe_prompt = "Reply with exactly: ok"
+    try:
+        result = subprocess.run(
+            ["copilot", "--autopilot", "--yolo", "--no-ask-user", "-p", probe_prompt],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "Warning: Copilot CLI did not respond within 60 s during the auth probe.\n"
+            "  Proceeding, but Copilot commands may fail if you are not logged in.",
+            file=sys.stderr,
+        )
+        return
+    except OSError as exc:
+        # shutil.which already confirmed copilot is on PATH, so this is unusual.
+        print(f"Warning: could not run Copilot CLI for auth probe: {exc}", file=sys.stderr)
+        return
+
+    output = (result.stdout + result.stderr).lower()
+    auth_failure = any(p in output for p in _COPILOT_AUTH_ERROR_PATTERNS)
+
+    if auth_failure:
+        print(
+            "ERROR: Copilot CLI is not authenticated.\n\n"
+            + (result.stdout + result.stderr).strip() + "\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if result.returncode != 0:
+        print(
+            f"ERROR: Copilot CLI probe exited with code {result.returncode}.\n"
+            "  Ensure the Copilot CLI is installed and working correctly.\n"
+            f"  Output:\n{(result.stdout + result.stderr).strip()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Tee: mirror stdout to a log file
 # ---------------------------------------------------------------------------
@@ -566,6 +628,9 @@ def send_to_copilot(prompt: str, work_dir: str, model: str = "gpt-4o") -> subpro
     Run: copilot --model <model> --autopilot --yolo --no-ask-user -p <prompt>
     in the specified working directory.  Output is streamed through sys.stdout
     so it is captured by the session log when logging is active.
+
+    Returns a CompletedProcess whose ``stdout`` attribute contains the full
+    combined output (stdout + stderr) so callers can inspect it for errors.
     """
     proc = subprocess.Popen(
         ["copilot", "--model", model, "--autopilot", "--yolo", "--no-ask-user", "-p", prompt],
@@ -575,10 +640,16 @@ def send_to_copilot(prompt: str, work_dir: str, model: str = "gpt-4o") -> subpro
         text=True,
     )
     assert proc.stdout is not None
+    collected: list[str] = []
     for line in proc.stdout:
         print(line, end="", flush=True)
+        collected.append(line)
     proc.wait()
-    return subprocess.CompletedProcess(args=proc.args, returncode=proc.returncode)
+    return subprocess.CompletedProcess(
+        args=proc.args,
+        returncode=proc.returncode,
+        stdout="".join(collected),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +711,22 @@ def _build_copilot_prompt(comment: dict) -> str:
     return prompt
 
 
+def _has_uncommitted_changes(work_dir: str) -> bool:
+    """Return True if the working tree has any modifications relative to HEAD."""
+    diff_r = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=work_dir, capture_output=True, text=True, timeout=15,
+    )
+    if diff_r.returncode == 0 and diff_r.stdout.strip():
+        return True
+    # Also catch untracked new files
+    status_r = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=work_dir, capture_output=True, text=True, timeout=10,
+    )
+    return bool(status_r.returncode == 0 and status_r.stdout.strip())
+
+
 def _fix_single_comment(comment: dict, label: str, args, work_dir: str) -> None:
     """Build a Copilot prompt for one comment, send it, and resolve the thread on success."""
     prompt = _build_copilot_prompt(comment)
@@ -649,8 +736,12 @@ def _fix_single_comment(comment: dict, label: str, args, work_dir: str) -> None:
     result = send_to_copilot(prompt, work_dir, model=args.model)
 
     if result.returncode != 0:
-        print(f"Warning: gh copilot exited with code {result.returncode}")
+        print(f"Warning: copilot exited with code {result.returncode} — thread will NOT be resolved.")
+    elif any(p in result.stdout.lower() for p in _COPILOT_AUTH_ERROR_PATTERNS):
+        print("Warning: Copilot output contains an authentication error — thread will NOT be resolved.")
     else:
+        if not _has_uncommitted_changes(work_dir):
+            print("Copilot made no file changes — comment may already be addressed or invalid.")
         print("Marking thread as resolved \u2026")
         try:
             resolve_thread(
@@ -747,9 +838,10 @@ def _parse_conflict_hunks(abs_path: str) -> list[dict]:
     return hunks
 
 
-def _resolve_conflict_file_with_copilot(rel_path: str, comments: list[dict], work_dir: str, args) -> None:
+def _resolve_conflict_file_with_copilot(rel_path: str, comments: list[dict], work_dir: str, args) -> bool:
     """Resolve conflict markers in *rel_path* one hunk at a time.
 
+    Returns True if all conflict hunks were resolved, False if any remain.
     Each hunk gets its own focused Copilot call: the two code sides of the
     conflict plus the *intents* (the original PR comments that produced the two
     fixes). The intents are framed as context for *why* each side exists, not
@@ -804,7 +896,9 @@ def _resolve_conflict_file_with_copilot(rel_path: str, comments: list[dict], wor
         new_hunks = _parse_conflict_hunks(abs_path)
         if len(new_hunks) >= len(hunks):
             print(f"    Warning: hunk at line {hunk['line']} was not resolved. Stopping.")
-            break
+            return False
+
+    return True
 
 
 def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -> None:
@@ -949,7 +1043,8 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                 continue
 
             if not patch.strip():
-                print("No changes were made by Copilot. Skipping.")
+                print("Copilot made no file changes — comment may already be addressed or invalid.")
+                applied_threads.append(comment)
                 print()
                 continue
 
@@ -986,19 +1081,22 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                     f"{len(all_conflicted_files)} file(s), one Copilot call each …"
                 )
                 print(f"{chr(9552) * 60}\n")
+                failed_files: set[str] = set()
                 for f_path in all_conflicted_files:
                     relevant = _comments_for_file(f_path, conflicted_threads)
                     print(f"  Resolving `{f_path}` ({len(relevant)} related comment(s)) …")
-                    _resolve_conflict_file_with_copilot(f_path, relevant, work_dir, args)
+                    resolved_ok = _resolve_conflict_file_with_copilot(f_path, relevant, work_dir, args)
+                    if not resolved_ok:
+                        failed_files.add(f_path)
                 still_conflicted = _find_conflicted_files(work_dir)
-                if still_conflicted:
+                unresolved_files = set(still_conflicted) | failed_files
+                if unresolved_files:
                     print(
                         f"\n\u26a0\ufe0f  Copilot could not fully resolve conflicts in: "
-                        f"{', '.join(still_conflicted)}\n"
+                        f"{', '.join(sorted(unresolved_files))}\n"
                         "  Conflict markers remain — resolve manually."
                     )
                     # Only promote threads whose files are fully clean
-                    unresolved_files = set(still_conflicted)
                     for comment in conflicted_threads:
                         fp = (comment.get("thread_context") or {}).get("filePath", "").lstrip("/")
                         if not fp or fp not in unresolved_files:
@@ -1139,6 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     check_dependencies()
+    check_copilot_login()
 
     parser = build_parser()
     args = parser.parse_args()
