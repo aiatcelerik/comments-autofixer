@@ -22,6 +22,7 @@ Two processing modes are available:
 | Python 3.10+ | Uses union types and `match` syntax |
 | `requests`, `python-dotenv`, `questionary` | Installed via `pip install -r requirements.txt` |
 | `git` | Must be on `PATH` |
+| GitHub CLI (`gh`) | Must be on `PATH` and authenticated (`gh auth login`). The script validates auth with `gh auth status` before processing comments. |
 | GitHub Copilot CLI | See [github/copilot-cli](https://github.com/github/copilot-cli). Install via `curl -fsSL https://gh.io/copilot-install \| bash` (macOS/Linux), `winget install GitHub.Copilot` (Windows), or `npm install -g @github/copilot`. Requires an active Copilot subscription. |
 | Azure DevOps PAT | Requires **Code (Read & Write)** and **Pull Request Threads (Read & Write)** scopes |
 
@@ -72,6 +73,10 @@ UNTIL=
 # Also process threads that are already resolved or closed (default: active only).
 INCLUDE_RESOLVED=false
 
+# Optional: only process comments whose text contains one of these substrings.
+# Comma-separated list; matching is case-sensitive and literal (include brackets).
+COMMENT_PREFIXES=[PERFORMANCE],[ARCHITECTURE],[REFACTOR],[SECURITY]
+
 # Print comments without calling Copilot or updating threads; saves raw API response to JSON.
 DRY_RUN=false
 # Directory for the timestamped session log file (default: current directory).
@@ -95,6 +100,7 @@ All flags are optional — see [Value resolution order](#value-resolution-order)
 | `--since DATE` | `SINCE` |
 | `--until DATE` | `UNTIL` |
 | `--log-dir DIR` | `LOG_DIR` |
+| *(no CLI flag)* | `COMMENT_PREFIXES` |
 
 ## Usage
 

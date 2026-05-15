@@ -5,6 +5,7 @@ to the Copilot CLI.
 
 Requirements:
   pip install requests python-dotenv
+    GitHub CLI ('gh') available on PATH and authenticated
   copilot CLI available on PATH
   .env file in the working directory (optional)
 
@@ -45,6 +46,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_comment_prefixes(raw: str | None) -> tuple[str, ...]:
+    """Parse comma-separated comment match tokens from COMMENT_PREFIXES."""
+    if not raw:
+        return ()
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 # ---------------------------------------------------------------------------
 # Dependency validation
 # ---------------------------------------------------------------------------
@@ -67,6 +75,10 @@ def check_dependencies() -> None:
 
     # External CLI tools
     cli_tools = {
+        "gh": (
+            "GitHub CLI ('gh') is not found on PATH.\n"
+            "  Fix: install from https://cli.github.com/"
+        ),
         "copilot": (
             "GitHub Copilot CLI ('copilot') is not found on PATH.\n"
             "  Fix: install via 'gh extension install github/gh-copilot' "
@@ -101,49 +113,38 @@ _COPILOT_AUTH_ERROR_PATTERNS = (
 )
 
 
-def check_copilot_login() -> None:
-    """Verify the Copilot CLI is authenticated before processing any comments.
+def check_github_cli_login() -> None:
+    """Verify GitHub CLI authentication before processing any comments.
 
-    Runs a minimal probe invocation (``copilot --no-ask-user -p ...``) and
-    inspects the exit code and output for authentication errors.  Exits with a
-    descriptive message so that comments are never marked as resolved without
-    Copilot having actually run.
+    Uses ``gh auth status`` as the source of truth for GitHub authentication
+    instead of probing the Copilot CLI directly.
     """
-    probe_prompt = "Reply with exactly: ok"
     try:
         result = subprocess.run(
-            ["copilot", "--autopilot", "--yolo", "--no-ask-user", "-p", probe_prompt],
+            ["gh", "auth", "status"],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=30,
         )
     except subprocess.TimeoutExpired:
         print(
-            "Warning: Copilot CLI did not respond within 60 s during the auth probe.\n"
-            "  Proceeding, but Copilot commands may fail if you are not logged in.",
+            "ERROR: GitHub CLI auth check timed out after 30 s.\n"
+            "  Run 'gh auth status' manually and ensure you're logged in.",
             file=sys.stderr,
         )
-        return
+        sys.exit(1)
     except OSError as exc:
-        # shutil.which already confirmed copilot is on PATH, so this is unusual.
-        print(f"Warning: could not run Copilot CLI for auth probe: {exc}", file=sys.stderr)
-        return
-
-    output = (result.stdout + result.stderr).lower()
-    auth_failure = any(p in output for p in _COPILOT_AUTH_ERROR_PATTERNS)
-
-    if auth_failure:
+        # shutil.which already confirmed gh is on PATH, so this is unusual.
         print(
-            "ERROR: Copilot CLI is not authenticated.\n\n"
-            + (result.stdout + result.stderr).strip() + "\n",
+            f"ERROR: could not run GitHub CLI auth check: {exc}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     if result.returncode != 0:
         print(
-            f"ERROR: Copilot CLI probe exited with code {result.returncode}.\n"
-            "  Ensure the Copilot CLI is installed and working correctly.\n"
+            f"ERROR: GitHub CLI is not authenticated (exit code {result.returncode}).\n"
+            "  Run 'gh auth login' and try again.\n"
             f"  Output:\n{(result.stdout + result.stderr).strip()}",
             file=sys.stderr,
         )
@@ -304,10 +305,14 @@ def fetch_pr_comments(org: str, project: str, repo: str, pr_id: int, pat: str, i
     response.raise_for_status()
     raw = response.json()
 
+    _RESOLVED_STATUSES = {"fixed", "wontFix", "closed", "byDesign"}
     comments: list[dict] = []
     for thread in response.json().get("value", []):
-        # Skip non-active threads unless --include-resolved is set
-        if not include_resolved and thread.get("status") != "active":
+        # Skip resolved threads unless --include-resolved is set.
+        # Copilot review comments arrive with status "pending" or "unknown",
+        # so we exclude only explicitly resolved statuses rather than
+        # whitelisting "active" alone.
+        if not include_resolved and thread.get("status") in _RESOLVED_STATUSES:
             continue
 
         # Scan comments forward: capture the first user comment (the review).
@@ -1237,10 +1242,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     check_dependencies()
-    check_copilot_login()
+    check_github_cli_login()
 
     parser = build_parser()
     args = parser.parse_args()
+    comment_prefixes = _parse_comment_prefixes(os.environ.get("COMMENT_PREFIXES"))
 
     # ---- Always auto-detect org/project/repo from git remote ----
     _git = _detect_from_git(args.work_dir or os.getcwd())
@@ -1439,6 +1445,21 @@ def main() -> None:
         print(f"Date filter applied: {before} → {len(comments)} comment(s).")
         if not comments:
             print("No comments match the date filter.")
+            return
+
+    if comment_prefixes:
+        before = len(comments)
+        comments = [
+            c
+            for c in comments
+            if any(token in c.get("content", "") for token in comment_prefixes)
+        ]
+        print(
+            "Prefix filter applied via COMMENT_PREFIXES "
+            f"({', '.join(comment_prefixes)}): {before} -> {len(comments)} comment(s)."
+        )
+        if not comments:
+            print("No comments match the prefix filter.")
             return
 
     if args.order == "desc":
