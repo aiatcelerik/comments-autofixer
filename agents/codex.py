@@ -66,10 +66,6 @@ class CodexAgent:
     def build_command(self, prompt: str, work_dir: str, model: str) -> list[str]:
         return [
             "codex",
-            "--ask-for-approval",
-            "never",
-            "--sandbox",
-            "danger-full-access",
             "--dangerously-bypass-approvals-and-sandbox",
             "exec",
             "--model",
