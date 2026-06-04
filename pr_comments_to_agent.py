@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
 Fetch comments from an Azure DevOps Pull Request and send each one
-to the Copilot CLI.
+to an AI coding CLI.
 
 Requirements:
   pip install requests python-dotenv
-    GitHub CLI ('gh') available on PATH and authenticated
-  copilot CLI available on PATH
+  selected AI coding CLI available on PATH
   .env file in the working directory (optional)
 
 Usage examples:
   # Basic usage (PAT from environment variable)
   set AZURE_DEVOPS_PAT=<your-pat>
-  python pr_comments_to_copilot.py --org myorg --project myproject --repo myrepo --pr-id 42
+  python pr_comments_to_agent.py --org myorg --project myproject --repo myrepo --pr-id 42
 
   # Specify work directory and PAT directly
-  python pr_comments_to_copilot.py --org myorg --project myproject --repo myrepo --pr-id 42 \
+  python pr_comments_to_agent.py --org myorg --project myproject --repo myrepo --pr-id 42 \
       --pat <your-pat> --work-dir C:\Projects\myrepo
 
   # Use a specific model
-  python pr_comments_to_copilot.py ... --model claude-3.5-sonnet
+  python pr_comments_to_agent.py ... --model claude-3.5-sonnet
 
-  # Preview comments without calling Copilot
-  python pr_comments_to_copilot.py ... --dry-run
+  # Preview comments without calling an AI coding CLI
+  python pr_comments_to_agent.py ... --dry-run
 """
 
 import argparse
@@ -43,6 +42,8 @@ import questionary
 import requests
 from dotenv import load_dotenv
 
+import agents
+
 load_dotenv()
 
 
@@ -57,7 +58,7 @@ def _parse_comment_prefixes(raw: str | None) -> tuple[str, ...]:
 # Dependency validation
 # ---------------------------------------------------------------------------
 
-def check_dependencies() -> None:
+def check_dependencies(agent_name: str) -> None:
     """Verify all required tools and Python packages are available.
 
     Exits with a descriptive error message if anything is missing.
@@ -73,22 +74,14 @@ def check_dependencies() -> None:
             "  Fix: pip install requests"
         )
 
-    # External CLI tools
+    agent = agents.get(agent_name)
     cli_tools = {
-        "gh": (
-            "GitHub CLI ('gh') is not found on PATH.\n"
-            "  Fix: install from https://cli.github.com/"
-        ),
-        "copilot": (
-            "GitHub Copilot CLI ('copilot') is not found on PATH.\n"
-            "  Fix: install via 'gh extension install github/gh-copilot' "
-            "and ensure 'gh copilot' (or a 'copilot' wrapper) is on your PATH."
-        ),
         "git": (
             "Git ('git') is not found on PATH.\n"
             "  Fix: install Git from https://git-scm.com/downloads"
         ),
     }
+    cli_tools.update(agent.required_tools())
     for tool, message in cli_tools.items():
         if shutil.which(tool) is None:
             errors.append(message)
@@ -97,57 +90,6 @@ def check_dependencies() -> None:
         print("ERROR: Missing required dependencies:\n", file=sys.stderr)
         for i, msg in enumerate(errors, start=1):
             print(f"  {i}. {msg}\n", file=sys.stderr)
-        sys.exit(1)
-
-
-_COPILOT_AUTH_ERROR_PATTERNS = (
-    "no authentication information found",
-    "not logged in",
-    "not authenticated",
-    "unauthenticated",
-    "unauthorized",
-    "please log in",
-    "login required",
-    "authentication required",
-    "sign in",
-)
-
-
-def check_github_cli_login() -> None:
-    """Verify GitHub CLI authentication before processing any comments.
-
-    Uses ``gh auth status`` as the source of truth for GitHub authentication
-    instead of probing the Copilot CLI directly.
-    """
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        print(
-            "ERROR: GitHub CLI auth check timed out after 30 s.\n"
-            "  Run 'gh auth status' manually and ensure you're logged in.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    except OSError as exc:
-        # shutil.which already confirmed gh is on PATH, so this is unusual.
-        print(
-            f"ERROR: could not run GitHub CLI auth check: {exc}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    if result.returncode != 0:
-        print(
-            f"ERROR: GitHub CLI is not authenticated (exit code {result.returncode}).\n"
-            "  Run 'gh auth login' and try again.\n"
-            f"  Output:\n{(result.stdout + result.stderr).strip()}",
-            file=sys.stderr,
-        )
         sys.exit(1)
 
 
@@ -625,44 +567,11 @@ def get_diff_context(work_dir: str, file_path: str, start_line: int | None, end_
 
 
 # ---------------------------------------------------------------------------
-# Copilot CLI helper
-# ---------------------------------------------------------------------------
-
-def send_to_copilot(prompt: str, work_dir: str, model: str = "gpt-4o") -> subprocess.CompletedProcess:
-    """
-    Run: copilot --model <model> --autopilot --yolo --no-ask-user -p <prompt>
-    in the specified working directory.  Output is streamed through sys.stdout
-    so it is captured by the session log when logging is active.
-
-    Returns a CompletedProcess whose ``stdout`` attribute contains the full
-    combined output (stdout + stderr) so callers can inspect it for errors.
-    """
-    proc = subprocess.Popen(
-        ["copilot", "--model", model, "--autopilot", "--yolo", "--no-ask-user", "-p", prompt],
-        cwd=work_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    assert proc.stdout is not None
-    collected: list[str] = []
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-        collected.append(line)
-    proc.wait()
-    return subprocess.CompletedProcess(
-        args=proc.args,
-        returncode=proc.returncode,
-        stdout="".join(collected),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Single-comment fix helper (shared by interactive and batch modes)
 # ---------------------------------------------------------------------------
 
-def _build_copilot_prompt(comment: dict) -> str:
-    """Return the Copilot prompt string for a single PR comment."""
+def _build_agent_prompt(comment: dict) -> str:
+    """Return the AI coding CLI prompt string for a single PR comment."""
     ctx = comment.get("thread_context")
     if ctx:
         file_path = ctx.get("filePath", "(unknown)")
@@ -733,20 +642,33 @@ def _has_uncommitted_changes(work_dir: str) -> bool:
 
 
 def _fix_single_comment(comment: dict, label: str, args, work_dir: str) -> None:
-    """Build a Copilot prompt for one comment, send it, and resolve the thread on success."""
-    prompt = _build_copilot_prompt(comment)
+    """Build a prompt for one comment, send it, and resolve the thread on success."""
+    prompt = _build_agent_prompt(comment)
+    agent = args.agent_impl
 
-    print(f"{label} Sending to Copilot CLI  model={args.model}  work-dir={work_dir}")
+    print(
+        f"{label} Sending to {agent.display_name}  "
+        f"model={args.model}  work-dir={work_dir}"
+    )
     print(f"\n\u2500\u2500 Prompt \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n{prompt}\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
-    result = send_to_copilot(prompt, work_dir, model=args.model)
+    result = agents.send(agent, prompt, work_dir, model=args.model)
 
     if result.returncode != 0:
-        print(f"Warning: copilot exited with code {result.returncode} — thread will NOT be resolved.")
-    elif any(p in result.stdout.lower() for p in _COPILOT_AUTH_ERROR_PATTERNS):
-        print("Warning: Copilot output contains an authentication error — thread will NOT be resolved.")
+        print(
+            f"Warning: {args.agent} exited with code {result.returncode} "
+            "— thread will NOT be resolved."
+        )
+    elif agents.has_auth_error(agent, result.stdout):
+        print(
+            f"Warning: {agent.display_name} output contains an "
+            "authentication error — thread will NOT be resolved."
+        )
     else:
         if not _has_uncommitted_changes(work_dir):
-            print("Copilot made no file changes — comment may already be addressed or invalid.")
+            print(
+                f"{agent.display_name} made no file changes — "
+                "comment may already be addressed or invalid."
+            )
         print("Marking thread as resolved \u2026")
         try:
             resolve_thread(
@@ -843,14 +765,14 @@ def _parse_conflict_hunks(abs_path: str) -> list[dict]:
     return hunks
 
 
-def _resolve_conflict_file_with_copilot(rel_path: str, comments: list[dict], work_dir: str, args) -> bool:
+def _resolve_conflict_file_with_agent(rel_path: str, comments: list[dict], work_dir: str, args) -> bool:
     """Resolve conflict markers in *rel_path* one hunk at a time.
 
     Returns True if all conflict hunks were resolved, False if any remain.
-    Each hunk gets its own focused Copilot call: the two code sides of the
+    Each hunk gets its own focused AI coding CLI call: the two code sides of the
     conflict plus the *intents* (the original PR comments that produced the two
     fixes). The intents are framed as context for *why* each side exists, not
-    as instructions — so Copilot knows to combine both rather than pick one.
+    as instructions — so the agent knows to combine both rather than pick one.
 
     After every call the file is re-read so line numbers remain accurate.
     """
@@ -894,9 +816,9 @@ def _resolve_conflict_file_with_copilot(rel_path: str, comments: list[dict], wor
             "file and do NOT commit or stage the result."
         )
         print(f"    Hunk at line {hunk['line']} ({len(hunks)} remaining) …")
-        send_to_copilot(prompt, work_dir, model=args.model)
+        agents.send(args.agent_impl, prompt, work_dir, model=args.model)
 
-        # Safety: if Copilot didn't reduce the hunk count, stop to avoid
+        # Safety: if the agent didn't reduce the hunk count, stop to avoid
         # an infinite loop.
         new_hunks = _parse_conflict_hunks(abs_path)
         if len(new_hunks) >= len(hunks):
@@ -913,7 +835,7 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
     No commits are created — git history is not affected.
 
     Each worker:
-      1. Runs Copilot in its own worktree (which starts at HEAD).
+      1. Runs the selected AI coding CLI in its own worktree (which starts at HEAD).
       2. Produces a ``git diff HEAD`` patch capturing all changes.
       3. Returns the patch and buffered output.
 
@@ -956,12 +878,13 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
         _print_lock = threading.Lock()
 
         def _worker(comment: dict, wt_path: str) -> tuple[int, str, str, int]:
-            """Run Copilot in wt_path, produce a diff patch.
-            Returns (thread_id, copilot_output, patch, returncode).
+            """Run the selected AI coding CLI in wt_path, produce a diff patch.
+            Returns (thread_id, agent_output, patch, returncode).
             """
-            prompt = _build_copilot_prompt(comment)
+            prompt = _build_agent_prompt(comment)
+            command = args.agent_impl.build_command(prompt, wt_path, args.model)
             proc = subprocess.Popen(
-                ["copilot", "--model", args.model, "--autopilot", "--yolo", "--no-ask-user", "-p", prompt],
+                command,
                 cwd=wt_path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1043,12 +966,15 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                 print(output)
 
             if returncode != 0:
-                print(f"Skipping: Copilot exited with code {returncode}.")
+                print(f"Skipping: {args.agent} exited with code {returncode}.")
                 print()
                 continue
 
             if not patch.strip():
-                print("Copilot made no file changes — comment may already be addressed or invalid.")
+                print(
+                    f"{args.agent_impl.display_name} made no file changes — "
+                    "comment may already be addressed or invalid."
+                )
                 applied_threads.append(comment)
                 print()
                 continue
@@ -1076,28 +1002,28 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                 applied_threads.append(comment)
             print()
 
-        # ---- Pass 2: one focused Copilot call per conflicted file ----
+        # ---- Pass 2: one focused AI coding CLI call per conflicted file ----
         if conflicted_threads:
             all_conflicted_files = _find_conflicted_files(work_dir)
             if all_conflicted_files:
                 print(f"\n{chr(9552) * 60}")
                 print(
-                    f"Pass 2: Resolving conflicts — "
-                    f"{len(all_conflicted_files)} file(s), one Copilot call each …"
+                    f"Pass 2: Resolving conflicts — {len(all_conflicted_files)} "
+                    f"file(s), one {args.agent_impl.display_name} call each …"
                 )
                 print(f"{chr(9552) * 60}\n")
                 failed_files: set[str] = set()
                 for f_path in all_conflicted_files:
                     relevant = _comments_for_file(f_path, conflicted_threads)
                     print(f"  Resolving `{f_path}` ({len(relevant)} related comment(s)) …")
-                    resolved_ok = _resolve_conflict_file_with_copilot(f_path, relevant, work_dir, args)
+                    resolved_ok = _resolve_conflict_file_with_agent(f_path, relevant, work_dir, args)
                     if not resolved_ok:
                         failed_files.add(f_path)
                 still_conflicted = _find_conflicted_files(work_dir)
                 unresolved_files = set(still_conflicted) | failed_files
                 if unresolved_files:
                     print(
-                        f"\n\u26a0\ufe0f  Copilot could not fully resolve conflicts in: "
+                        f"\n\u26a0\ufe0f  {args.agent_impl.display_name} could not fully resolve conflicts in: "
                         f"{', '.join(sorted(unresolved_files))}\n"
                         "  Conflict markers remain — resolve manually."
                     )
@@ -1107,7 +1033,7 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                         if not fp or fp not in unresolved_files:
                             applied_threads.append(comment)
                 else:
-                    print("All conflicts resolved by Copilot.")
+                    print(f"All conflicts resolved by {args.agent_impl.display_name}.")
                     applied_threads.extend(conflicted_threads)
             else:
                 # --3way failed but left no markers (e.g. binary file); skip those threads
@@ -1151,7 +1077,7 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch Azure DevOps PR comments and send each one to the GitHub Copilot CLI."
+            "Fetch Azure DevOps PR comments and send each one to an AI coding CLI."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1167,19 +1093,29 @@ def build_parser() -> argparse.ArgumentParser:
              "Needs 'Code (Read & Write)' and 'Pull Request Threads (Read & Write)' scopes.",
     )
 
-    # Copilot execution
+    # AI coding CLI execution
+    parser.add_argument(
+        "--agent",
+        default=os.environ.get("AGENT", agents.DEFAULT_NAME),
+        choices=agents.names(),
+        help=(
+            "AI coding CLI to use. "
+            f"Choices: {', '.join(agents.names())}. Default: {agents.DEFAULT_NAME}. "
+            "Or set AGENT in .env."
+        ),
+    )
     parser.add_argument(
         "--work-dir",
         default=os.environ.get("WORK_DIR") or None,
         help=(
-            "Directory where Copilot CLI commands are executed. "
+            "Directory where AI coding CLI commands are executed. "
             "Defaults to the git repo root, or the current working directory. Or set WORK_DIR in .env."
         ),
     )
     parser.add_argument(
         "--model",
         default=os.environ.get("MODEL", "claude-sonnet-4.6"),
-        help="Model to pass to the Copilot CLI (default: claude-sonnet-4.6; or set MODEL in .env).",
+        help="Model to pass to the selected AI coding CLI (default: claude-sonnet-4.6; or set MODEL in .env).",
     )
 
     # Misc
@@ -1194,7 +1130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         default=_env_bool("DRY_RUN"),
-        help="Print each comment but do NOT call the Copilot CLI. Or set DRY_RUN=true in .env.",
+        help="Print each comment but do NOT call the selected AI coding CLI. Or set DRY_RUN=true in .env.",
     )
     parser.add_argument(
         "--include-resolved",
@@ -1226,7 +1162,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help=(
-            "Number of parallel Copilot workers for batch mode (default: 1 = sequential). "
+            "Number of parallel AI coding CLI workers for batch mode (default: 1 = sequential). "
             "When > 1, each comment is fixed in an isolated git worktree. Or set WORKERS in .env."
         ),
     )
@@ -1241,11 +1177,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    check_dependencies()
-    check_github_cli_login()
-
     parser = build_parser()
     args = parser.parse_args()
+    args.agent_impl = agents.get(args.agent)
+    check_dependencies(args.agent)
+    args.agent_impl.preflight()
     comment_prefixes = _parse_comment_prefixes(os.environ.get("COMMENT_PREFIXES"))
 
     # ---- Always auto-detect org/project/repo from git remote ----
@@ -1321,7 +1257,7 @@ def main() -> None:
     _log_path = os.path.join(_log_dir, f"pr_{args   .pr_id}_{_ts}.log")
     _log_file = open(_log_path, "w", encoding="utf-8")  # noqa: SIM115
     _log_file.write(
-        f"# pr_comments_to_copilot  PR={args.pr_id}"
+        f"# pr_comments_to_agent  PR={args.pr_id}"
         f"  started={datetime.now(timezone.utc).isoformat()}\n\n"
     )
     _log_file.flush()
@@ -1552,7 +1488,7 @@ def main() -> None:
         print()
 
         try:
-            answer = _prompt_yes_no("Fix this comment with Copilot?", default=True)
+            answer = _prompt_yes_no(f"Fix this comment with {args.agent_impl.display_name}?", default=True)
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.")
             aborted = True
@@ -1604,7 +1540,7 @@ def main() -> None:
 
             if not use_suggestion:
                 try:
-                    extra_prompt = input("Any additional instructions for Copilot before fixing? (press Enter to skip): ").strip()
+                    extra_prompt = input(f"Any additional instructions for {args.agent_impl.display_name} before fixing? (press Enter to skip): ").strip()
                 except (EOFError, KeyboardInterrupt):
                     print("\nAborted.")
                     aborted = True
@@ -1612,11 +1548,11 @@ def main() -> None:
 
                 if extra_prompt:
                     comment["extra_prompt"] = extra_prompt
-                # Clear the suggestion so Copilot can craft a fix using the comment and optional extra instructions.
+                # Clear the suggestion so the agent can craft a fix using the comment and optional extra instructions.
                 comment["suggestion"] = None
         else:
             try:
-                extra_prompt = input("Any additional instructions for Copilot before fixing? (press Enter to skip): ").strip()
+                extra_prompt = input(f"Any additional instructions for {args.agent_impl.display_name} before fixing? (press Enter to skip): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nAborted.")
                 aborted = True
@@ -1629,17 +1565,17 @@ def main() -> None:
             _fix_single_comment(comment, f"[{idx}/{len(comments)}]", args, work_dir)
         else:
             to_fix.append(comment)
-            print("Queued for Copilot.\n")
+            print(f"Queued for {args.agent_impl.display_name}.\n")
 
-    # ---- Phase 2: Send all queued comments to Copilot (batch mode only) ----
+    # ---- Phase 2: Send all queued comments to the selected agent (batch mode only) ----
     if mode == "batch":
         if not to_fix:
             if not aborted:
-                print("\nNo comments queued for Copilot.")
+                print(f"\nNo comments queued for {args.agent_impl.display_name}.")
             return
 
         print(f"\n{'═' * 60}")
-        print(f"Sending {len(to_fix)} queued comment(s) to Copilot …")
+        print(f"Sending {len(to_fix)} queued comment(s) to {args.agent_impl.display_name} …")
         print(f"{'═' * 60}\n")
 
         if args.workers > 1:

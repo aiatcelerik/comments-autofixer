@@ -1,13 +1,13 @@
 # Comments Autofixer
 
-Fetches active review comments from an **Azure DevOps Pull Request** and sends each one to the **GitHub Copilot CLI** to apply fixes automatically. After each successful fix the corresponding PR thread is marked as *fixed* via the Azure DevOps REST API.
+Fetches active review comments from an **Azure DevOps Pull Request** and sends each one to the **GitHub Copilot CLI**, **Codex CLI**, or **Claude Code** to apply fixes automatically. After each successful fix the corresponding PR thread is marked as *fixed* via the Azure DevOps REST API.
 
 ## How it works
 
 1. Connects to Azure DevOps and fetches all active (non-resolved) PR threads.
 2. Presents each comment interactively with a side-by-side diff of the affected code.
 3. You approve or skip each comment. Skipped comments can include a reply and are marked *won't fix*.
-4. Approved comments are sent to the Copilot CLI (`copilot --autopilot --yolo`) which edits the files in place.
+4. Approved comments are sent to the selected AI coding CLI, which edits the files in place.
 5. On success, the PR thread is resolved automatically.
 
 Two processing modes are available:
@@ -22,9 +22,13 @@ Two processing modes are available:
 | Python 3.10+ | Uses union types and `match` syntax |
 | `requests`, `python-dotenv`, `questionary` | Installed via `pip install -r requirements.txt` |
 | `git` | Must be on `PATH` |
-| GitHub CLI (`gh`) | Must be on `PATH` and authenticated (`gh auth login`). The script validates auth with `gh auth status` before processing comments. |
-| GitHub Copilot CLI | See [github/copilot-cli](https://github.com/github/copilot-cli). Install via `curl -fsSL https://gh.io/copilot-install \| bash` (macOS/Linux), `winget install GitHub.Copilot` (Windows), or `npm install -g @github/copilot`. Requires an active Copilot subscription. |
+| GitHub CLI (`gh`) | Required only for `AGENT=copilot` when no Copilot token env var is set. Must be on `PATH` and authenticated (`gh auth login`). The script validates auth with `gh auth status` before processing comments. |
+| GitHub Copilot CLI | Required only for `AGENT=copilot`. See [github/copilot-cli](https://github.com/github/copilot-cli). Install via `curl -fsSL https://gh.io/copilot-install \| bash` (macOS/Linux), `winget install GitHub.Copilot` (Windows), or `npm install -g @github/copilot`. Requires an active Copilot subscription. |
+| Codex CLI | Required only for `AGENT=codex`. Must be on `PATH` and authenticated with `codex login`. The script validates auth with `codex login status` before processing comments. |
+| Claude Code | Required only for `AGENT=claude`. Must be on `PATH` and authenticated with `claude auth login`. The script validates auth with `claude auth status` before processing comments. |
 | Azure DevOps PAT | Requires **Code (Read & Write)** and **Pull Request Threads (Read & Write)** scopes |
+
+All agents are invoked in autonomous mode. Copilot runs with `--autopilot --allow-all --no-ask-user`; Codex runs with `--ask-for-approval never --sandbox danger-full-access --dangerously-bypass-approvals-and-sandbox`; Claude Code runs with `--dangerously-skip-permissions --print`.
 
 ## Installation
 
@@ -60,8 +64,17 @@ PR_ID=42
 
 # Path to the repository whose PR comments you are fixing.
 WORK_DIR=/path/to/repo
-# Model name passed to the Copilot CLI.
+
+# AI coding CLI to use: copilot (default), codex, or claude.
+AGENT=copilot
+# Model name passed to the selected AI coding CLI.
 MODEL=claude-sonnet-4.6
+
+# Optional Copilot CLI auth for headless use. If unset, `gh auth status` is used.
+COPILOT_GITHUB_TOKEN=
+GH_TOKEN=
+GITHUB_TOKEN=
+
 # Processing mode: interactive (fix each comment immediately) or batch (review all, then fix all).
 MODE=batch
 
@@ -77,7 +90,7 @@ INCLUDE_RESOLVED=false
 # Comma-separated list; matching is case-sensitive and literal (include brackets).
 COMMENT_PREFIXES=[PERFORMANCE],[ARCHITECTURE],[REFACTOR],[SECURITY]
 
-# Print comments without calling Copilot or updating threads; saves raw API response to JSON.
+# Print comments without calling the selected AI coding CLI or updating threads; saves raw API response to JSON.
 DRY_RUN=false
 # Directory for the timestamped session log file (default: current directory).
 LOG_DIR=
@@ -91,6 +104,7 @@ All flags are optional — see [Value resolution order](#value-resolution-order)
 |---|---|
 | `--pat` | `AZURE_DEVOPS_PAT` |
 | `--pr-id` | `PR_ID` |
+| `--agent` | `AGENT` |
 | `--work-dir` | `WORK_DIR` |
 | `--model` | `MODEL` |
 | `--mode` | `MODE` |
@@ -100,6 +114,9 @@ All flags are optional — see [Value resolution order](#value-resolution-order)
 | `--since DATE` | `SINCE` |
 | `--until DATE` | `UNTIL` |
 | `--log-dir DIR` | `LOG_DIR` |
+| *(read by Copilot CLI)* | `COPILOT_GITHUB_TOKEN` |
+| *(read by Copilot CLI)* | `GH_TOKEN` |
+| *(read by Copilot CLI)* | `GITHUB_TOKEN` |
 | *(no CLI flag)* | `COMMENT_PREFIXES` |
 
 ## Usage
@@ -107,22 +124,28 @@ All flags are optional — see [Value resolution order](#value-resolution-order)
 ```bash
 # Run from inside the repository — org, project, repo and PR ID are auto-detected
 export AZURE_DEVOPS_PAT=<your-pat>
-python pr_comments_to_copilot.py
+python pr_comments_to_agent.py
 
 # Override PR ID explicitly
-python pr_comments_to_copilot.py --pr-id 42
+python pr_comments_to_agent.py --pr-id 42
 
 # Use a specific model
-python pr_comments_to_copilot.py --model gpt-4o
+python pr_comments_to_agent.py --model gpt-4o
 
-# Preview comments without calling Copilot (saves raw API response to JSON)
-python pr_comments_to_copilot.py --dry-run
+# Use Codex CLI instead of Copilot CLI
+python pr_comments_to_agent.py --agent codex --model gpt-5
+
+# Use Claude Code instead of Copilot CLI
+python pr_comments_to_agent.py --agent claude --model claude-sonnet-4-6
+
+# Preview comments without calling an AI coding CLI (saves raw API response to JSON)
+python pr_comments_to_agent.py --dry-run
 ```
 
 When the PAT is set in `.env` everything is auto-detected and you can simply run:
 
 ```bash
-python pr_comments_to_copilot.py
+python pr_comments_to_agent.py
 ```
 
 ## Session logging
