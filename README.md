@@ -1,6 +1,6 @@
 # Comments Autofixer
 
-Fetches active review comments from an **Azure DevOps Pull Request** and sends each one to the **GitHub Copilot CLI**, **Codex CLI**, or **Claude Code** to apply fixes automatically. After each successful fix the corresponding PR thread is marked as *fixed* via the Azure DevOps REST API.
+Fetches active review comments from an **Azure DevOps Pull Request** and sends each one to the selected AI coding CLI to apply fixes automatically. Supported agents include **GitHub Copilot CLI**, **Codex CLI**, **Claude Code**, **Gemini CLI**, and **Antigravity CLI**. After each successful fix the corresponding PR thread is marked as *fixed* via the Azure DevOps REST API.
 
 ## How it works
 
@@ -26,9 +26,11 @@ Two processing modes are available:
 | GitHub Copilot CLI | Required only for `AGENT=copilot`. See [github/copilot-cli](https://github.com/github/copilot-cli). Install via `curl -fsSL https://gh.io/copilot-install \| bash` (macOS/Linux), `winget install GitHub.Copilot` (Windows), or `npm install -g @github/copilot`. Requires an active Copilot subscription. |
 | Codex CLI | Required only for `AGENT=codex`. Must be on `PATH` and authenticated with `codex login`. The script validates auth with `codex login status` before processing comments. |
 | Claude Code | Required only for `AGENT=claude`. Must be on `PATH` and authenticated with `claude auth login`. The script validates auth with `claude auth status` before processing comments. |
+| Gemini CLI | Required only for `AGENT=gemini`. Must be on `PATH` and authenticated. The script validates the CLI with `gemini --version` before processing comments. |
+| Antigravity CLI | Required only for `AGENT=antigravity`. Must expose the `agy` command on `PATH` and be authenticated through Antigravity's keyring/browser sign-in flow. The script validates the CLI with `agy --version` before processing comments. |
 | Azure DevOps PAT | Requires **Code (Read & Write)** and **Pull Request Threads (Read & Write)** scopes |
 
-All agents are invoked in autonomous mode. Copilot runs with `--autopilot --allow-all --no-ask-user`; Codex runs with `--ask-for-approval never --sandbox danger-full-access --dangerously-bypass-approvals-and-sandbox`; Claude Code runs with `--dangerously-skip-permissions --print`.
+All agents are invoked in autonomous mode. Copilot runs with `--autopilot --allow-all --no-ask-user`; Codex runs with `--dangerously-bypass-approvals-and-sandbox`; Claude Code runs with `--dangerously-skip-permissions --print`; Gemini runs with `--yolo --skip-trust`; Antigravity runs with `--dangerously-skip-permissions --print` (and supports forwarding `--model` with automatic mapping to the exact model names used by `agy`).
 
 ## Installation
 
@@ -65,10 +67,10 @@ PR_ID=42
 # Path to the repository whose PR comments you are fixing.
 WORK_DIR=/path/to/repo
 
-# AI coding CLI to use: copilot (default), codex, or claude.
+# AI coding CLI to use: copilot (default), codex, claude, gemini, or antigravity.
 AGENT=copilot
-# Model name passed to the selected AI coding CLI.
-MODEL=claude-sonnet-4.6
+# Model name passed to the selected AI coding CLI (defaults to agent-specific default if unset).
+MODEL=
 
 # Optional Copilot CLI auth for headless use. If unset, `gh auth status` is used.
 COPILOT_GITHUB_TOKEN=
@@ -137,6 +139,12 @@ python pr_comments_to_agent.py --agent codex --model gpt-5
 
 # Use Claude Code instead of Copilot CLI
 python pr_comments_to_agent.py --agent claude --model claude-sonnet-4-6
+
+# Use Gemini CLI instead of Copilot CLI
+python pr_comments_to_agent.py --agent gemini --model gemini-2.5-pro
+
+# Use Antigravity CLI instead of Copilot CLI
+python pr_comments_to_agent.py --agent antigravity
 
 # Preview comments without calling an AI coding CLI (saves raw API response to JSON)
 python pr_comments_to_agent.py --dry-run

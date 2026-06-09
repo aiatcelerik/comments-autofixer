@@ -1114,8 +1114,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("MODEL", "claude-sonnet-4.6"),
-        help="Model to pass to the selected AI coding CLI (default: claude-sonnet-4.6; or set MODEL in .env).",
+        default=os.environ.get("MODEL"),
+        help="Model to pass to the selected AI coding CLI (default: agent-specific default; or set MODEL in .env). "
+             "Examples: claude-sonnet-4.6, gemini-2.5-pro, Gemini 3.5 Flash (Medium).",
     )
 
     # Misc
@@ -1180,6 +1181,8 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     args.agent_impl = agents.get(args.agent)
+    if not args.model:
+        args.model = getattr(args.agent_impl, "default_model", None)
     check_dependencies(args.agent)
     args.agent_impl.preflight()
     comment_prefixes = _parse_comment_prefixes(os.environ.get("COMMENT_PREFIXES"))

@@ -12,6 +12,7 @@ from os import environ
 class CopilotAgent:
     name: str = "copilot"
     display_name: str = "Copilot CLI"
+    default_model: str = "claude-sonnet-4.6"
     auth_error_patterns: tuple[str, ...] = (
         "no authentication information found",
         "not logged in",

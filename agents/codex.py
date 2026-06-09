@@ -11,6 +11,7 @@ from dataclasses import dataclass
 class CodexAgent:
     name: str = "codex"
     display_name: str = "Codex CLI"
+    default_model: str = "gpt-4o"
     auth_error_patterns: tuple[str, ...] = (
         "no authentication information found",
         "not logged in",

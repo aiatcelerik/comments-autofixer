@@ -5,12 +5,13 @@ from __future__ import annotations
 import subprocess
 from typing import Protocol
 
-from . import claude, codex, copilot
+from . import antigravity, claude, codex, copilot, gemini
 
 
 class Agent(Protocol):
     name: str
     display_name: str
+    default_model: str
     auth_error_patterns: tuple[str, ...]
 
     def required_tools(self) -> dict[str, str]:
@@ -30,6 +31,8 @@ _AGENTS: dict[str, Agent] = {
     copilot.AGENT.name: copilot.AGENT,
     codex.AGENT.name: codex.AGENT,
     claude.AGENT.name: claude.AGENT,
+    gemini.AGENT.name: gemini.AGENT,
+    antigravity.AGENT.name: antigravity.AGENT,
 }
 DEFAULT_NAME = copilot.AGENT.name
 

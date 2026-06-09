@@ -1,4 +1,4 @@
-"""Anthropic Claude Code agent implementation."""
+"""Google Gemini CLI agent implementation."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class ClaudeAgent:
-    name: str = "claude"
-    display_name: str = "Claude Code"
-    default_model: str = "claude-sonnet-4.6"
+class GeminiAgent:
+    name: str = "gemini"
+    display_name: str = "Gemini CLI"
+    default_model: str = "gemini-2.5-pro"
     auth_error_patterns: tuple[str, ...] = (
         "not logged in",
         "not authenticated",
@@ -21,59 +21,67 @@ class ClaudeAgent:
         "login required",
         "authentication required",
         "invalid api key",
-        "anthropic_api_key",
+        "google_api_key",
+        "api key not valid",
+        "permission denied",
     )
 
     def required_tools(self) -> dict[str, str]:
         return {
-            "claude": (
-                "Claude Code ('claude') is not found on PATH.\n"
-                "  Fix: install and authenticate Claude Code."
+            "gemini": (
+                "Gemini CLI ('gemini') is not found on PATH.\n"
+                "  Fix: install via 'npm install -g @google/gemini-cli' and authenticate."
             ),
         }
 
     def preflight(self) -> None:
-        """Verify Claude Code authentication before processing comments."""
+        """Verify Gemini CLI is available before processing comments."""
         try:
             result = subprocess.run(
-                ["claude", "auth", "status"],
+                ["gemini", "--version"],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
         except subprocess.TimeoutExpired:
             print(
-                "ERROR: Claude Code auth check timed out after 30 s.\n"
-                "  Run 'claude auth status' manually and ensure you're logged in.",
+                "ERROR: Gemini CLI version check timed out after 30 s.\n"
+                "  Run 'gemini --version' manually to verify installation.",
                 file=sys.stderr,
             )
             sys.exit(1)
         except OSError as exc:
             print(
-                f"ERROR: could not run Claude Code auth check: {exc}",
+                f"ERROR: could not run Gemini CLI: {exc}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
         if result.returncode != 0:
             print(
-                f"ERROR: Claude Code is not authenticated (exit code {result.returncode}).\n"
-                "  Run 'claude auth login' and try again.\n"
+                f"ERROR: Gemini CLI check failed (exit code {result.returncode}).\n"
+                "  Ensure 'gemini' is installed and authenticated.\n"
                 f"  Output:\n{(result.stdout + result.stderr).strip()}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
     def build_command(self, prompt: str, work_dir: str, model: str) -> list[str]:
-        claude_model = "claude-sonnet-4-6" if model == "claude-sonnet-4.6" else model
+        gemini_model = model
+        if model:
+            model_lower = model.lower()
+            if model_lower in ("claude-sonnet-4.6", "claude-sonnet-4-6"):
+                gemini_model = "gemini-2.5-pro"
+
         return [
-            "claude",
-            "--dangerously-skip-permissions",
+            "gemini",
             "--model",
-            claude_model,
-            "--print",
+            gemini_model,
+            "--yolo",
+            "--skip-trust",
+            "-p",
             prompt,
         ]
 
 
-AGENT = ClaudeAgent()
+AGENT = GeminiAgent()
