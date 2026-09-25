@@ -10,10 +10,11 @@ Fetches active review comments from an **Azure DevOps Pull Request** and sends e
 4. Approved comments are sent to the selected AI coding CLI, which edits the files in place.
 5. On success, the PR thread is resolved automatically.
 
-Two processing modes are available:
+Three processing modes are available:
 
 - **Interactive** — fix each comment immediately after you approve it (sequential).
 - **Batch** — review all comments first, then fix them all in one pass.
+- **Grouped** — like batch, but all approved comments on the same file are sent to the agent in a single prompt (one agent call per file). All threads in a group are resolved together.
 
 ## Prerequisites
 
@@ -77,7 +78,8 @@ COPILOT_GITHUB_TOKEN=
 GH_TOKEN=
 GITHUB_TOKEN=
 
-# Processing mode: interactive (fix each comment immediately) or batch (review all, then fix all).
+# Processing mode: interactive (fix each comment immediately), batch (review all, then fix all),
+# or grouped (like batch, but one prompt per file containing all of that file's comments).
 MODE=batch
 
 # Order comments are presented: asc (oldest first), desc (newest first), file (by file path).

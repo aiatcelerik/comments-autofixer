@@ -570,59 +570,139 @@ def get_diff_context(work_dir: str, file_path: str, start_line: int | None, end_
 # Single-comment fix helper (shared by interactive and batch modes)
 # ---------------------------------------------------------------------------
 
-def _build_agent_prompt(comment: dict) -> str:
-    """Return the AI coding CLI prompt string for a single PR comment."""
-    ctx = comment.get("thread_context")
-    if ctx:
-        file_path = ctx.get("filePath", "(unknown)")
-        right_start = (ctx.get("rightFileStart") or {}).get("line")
-        right_end   = (ctx.get("rightFileEnd")   or {}).get("line")
-        left_start  = (ctx.get("leftFileStart")  or {}).get("line")
-        left_end    = (ctx.get("leftFileEnd")    or {}).get("line")
-        if right_start and right_end and right_start != right_end:
-            location = f"lines {right_start}\u2013{right_end}"
-        elif right_start:
-            location = f"line {right_start}"
-        elif left_start and left_end and left_start != left_end:
-            location = f"lines {left_start}\u2013{left_end} (old file)"
-        elif left_start:
-            location = f"line {left_start} (old file)"
-        else:
-            location = None
-        where = f"`{file_path}`" + (f", {location}" if location else "")
-        task = f"Fix the following PR review comment in {where}:"
-    else:
-        task = "Fix the following PR review comment:"
+def _comment_location(ctx: dict) -> str | None:
+    """Return a human-readable line location for a thread context, or None."""
+    right_start = (ctx.get("rightFileStart") or {}).get("line")
+    right_end   = (ctx.get("rightFileEnd")   or {}).get("line")
+    left_start  = (ctx.get("leftFileStart")  or {}).get("line")
+    left_end    = (ctx.get("leftFileEnd")    or {}).get("line")
+    if right_start and right_end and right_start != right_end:
+        return f"lines {right_start}\u2013{right_end}"
+    if right_start:
+        return f"line {right_start}"
+    if left_start and left_end and left_start != left_end:
+        return f"lines {left_start}\u2013{left_end} (old file)"
+    if left_start:
+        return f"line {left_start} (old file)"
+    return None
 
+
+def _comment_instructions(comment: dict) -> str:
+    """Return the comment text plus any suggestion / custom fix / extra instructions."""
     extra_prompt = (comment.get("extra_prompt") or "").strip()
-    diff_block = ""
-    if comment.get("diff_snippet"):
-        diff_block = f"\n\nHere is the current diff for context:\n\n```diff\n{comment['diff_snippet']}\n```"
 
     if comment.get("custom_fix"):
-        prompt = (
-            f"Do NOT commit or stage any changes.\n\n"
-            f"{task}{diff_block}\n\n"
+        body = (
             f"{comment['content']}\n\n"
             f"Apply this custom fix:\n\n"
             f"{comment['custom_fix']}"
         )
         if extra_prompt:
-            prompt += f"\n\nAlso follow these additional instructions:\n\n{extra_prompt}"
+            body += f"\n\nAlso follow these additional instructions:\n\n{extra_prompt}"
     elif comment.get("suggestion"):
-        prompt = (
-            f"Do NOT commit or stage any changes.\n\n"
-            f"{task}{diff_block}\n\n"
+        body = (
             f"{comment['content']}\n\n"
             f"Apply this exact suggested change:\n\n"
             f"```\n{comment['suggestion']}\n```"
         )
     else:
-        prompt = f"Do NOT commit or stage any changes.\n\n{task}{diff_block}\n\n{comment['content']}"
+        body = comment["content"]
         if extra_prompt:
-            prompt += f"\n\nAlso follow these additional instructions:\n\n{extra_prompt}"
+            body += f"\n\nAlso follow these additional instructions:\n\n{extra_prompt}"
+    return body
 
-    return prompt
+
+def _build_agent_prompt(comment: dict) -> str:
+    """Return the AI coding CLI prompt string for a single PR comment or a file group."""
+    if comment.get("group"):
+        return _build_group_prompt(comment)
+
+    ctx = comment.get("thread_context")
+    if ctx:
+        file_path = ctx.get("filePath", "(unknown)")
+        location = _comment_location(ctx)
+        where = f"`{file_path}`" + (f", {location}" if location else "")
+        task = f"Fix the following PR review comment in {where}:"
+    else:
+        task = "Fix the following PR review comment:"
+
+    diff_block = ""
+    if comment.get("diff_snippet"):
+        diff_block = f"\n\nHere is the current diff for context:\n\n```diff\n{comment['diff_snippet']}\n```"
+
+    return f"Do NOT commit or stage any changes.\n\n{task}{diff_block}\n\n{_comment_instructions(comment)}"
+
+
+def _build_group_prompt(group: dict) -> str:
+    """Return one prompt covering every PR comment on the same file."""
+    members = group["group"]
+    file_path = group["thread_context"].get("filePath", "(unknown)")
+
+    # git diff yields the same snippet for every comment on a file; only the
+    # annotated-source fallback differs per comment. Show a shared diff once.
+    snippets = {c.get("diff_snippet") for c in members if c.get("diff_snippet")}
+    shared_diff = len(snippets) == 1 and all(c.get("diff_snippet") for c in members)
+
+    parts = [
+        "Do NOT commit or stage any changes.",
+        f"Fix the following {len(members)} PR review comments in `{file_path}`. "
+        "Address every one of them; treat each as a separate change to the same file.",
+    ]
+    if shared_diff:
+        parts.append(f"Here is the current diff for context:\n\n```diff\n{snippets.pop()}\n```")
+
+    for i, c in enumerate(members, start=1):
+        location = _comment_location(c.get("thread_context") or {})
+        section = f"### Comment {i}" + (f" \u2014 {location}" if location else "")
+        if not shared_diff and c.get("diff_snippet"):
+            section += f"\n\nContext:\n\n```diff\n{c['diff_snippet']}\n```"
+        section += f"\n\n{_comment_instructions(c)}"
+        parts.append(section)
+
+    return "\n\n".join(parts)
+
+
+def _group_comments_by_file(comments: list[dict]) -> list[dict]:
+    """Merge comments on the same file into one work item, keeping first-seen order.
+
+    Comments without a file (PR-level) and files with a single comment are left as-is.
+    A group is a dict with ``group`` (the member comments), plus ``thread_id`` and
+    ``thread_context`` taken from its first member so it can flow through the same
+    code paths as a single comment.
+    """
+    by_file: dict[str, list[dict]] = {}
+    items: list[dict | str] = []
+    for c in comments:
+        fp = ((c.get("thread_context") or {}).get("filePath") or "").lstrip("/")
+        if not fp:
+            items.append(c)
+            continue
+        if fp not in by_file:
+            by_file[fp] = []
+            items.append(fp)
+        by_file[fp].append(c)
+
+    result: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            result.append(item)
+            continue
+        members = by_file[item]
+        if len(members) == 1:
+            result.append(members[0])
+        else:
+            result.append({
+                "thread_id": members[0]["thread_id"],
+                "thread_context": members[0]["thread_context"],
+                "content": "\n\n".join(m["content"] for m in members),
+                "group": members,
+            })
+    return result
+
+
+def _expand_groups(items: list[dict]) -> list[dict]:
+    """Flatten file groups back into their individual comments."""
+    return [c for item in items for c in (item.get("group") or [item])]
 
 
 def _has_uncommitted_changes(work_dir: str) -> bool:
@@ -669,17 +749,18 @@ def _fix_single_comment(comment: dict, label: str, args, work_dir: str) -> None:
                 f"{agent.display_name} made no file changes — "
                 "comment may already be addressed or invalid."
             )
-        print("Marking thread as resolved \u2026")
-        try:
-            resolve_thread(
-                args.org, args.project, args.repo, args.pr_id,
-                comment["thread_id"], args.pat,
-            )
-            print("Thread marked as fixed.")
-        except requests.HTTPError as exc:
-            print(f"Warning: could not resolve thread: {exc.response.status_code} {exc.response.text}")
-        except requests.RequestException as exc:
-            print(f"Warning: network error while resolving thread: {exc}")
+        for member in _expand_groups([comment]):
+            print(f"Marking thread {member['thread_id']} as resolved \u2026")
+            try:
+                resolve_thread(
+                    args.org, args.project, args.repo, args.pr_id,
+                    member["thread_id"], args.pat,
+                )
+                print("Thread marked as fixed.")
+            except requests.HTTPError as exc:
+                print(f"Warning: could not resolve thread: {exc.response.status_code} {exc.response.text}")
+            except requests.RequestException as exc:
+                print(f"Warning: network error while resolving thread: {exc}")
     print()
 
 
@@ -961,7 +1042,11 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
             output, patch, returncode = results.get(thread_id, ("", "", 1))
 
             print("\u2500" * 60)
-            print(f"[{idx}/{len(worktrees)}] Thread {thread_id}")
+            if comment.get("group"):
+                ids = ", ".join(str(c["thread_id"]) for c in comment["group"])
+                print(f"[{idx}/{len(worktrees)}] Threads {ids} ({comment['thread_context'].get('filePath')})")
+            else:
+                print(f"[{idx}/{len(worktrees)}] Thread {thread_id}")
             if output:
                 print(output)
 
@@ -1014,7 +1099,7 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
                 print(f"{chr(9552) * 60}\n")
                 failed_files: set[str] = set()
                 for f_path in all_conflicted_files:
-                    relevant = _comments_for_file(f_path, conflicted_threads)
+                    relevant = _comments_for_file(f_path, _expand_groups(conflicted_threads))
                     print(f"  Resolving `{f_path}` ({len(relevant)} related comment(s)) …")
                     resolved_ok = _resolve_conflict_file_with_agent(f_path, relevant, work_dir, args)
                     if not resolved_ok:
@@ -1044,7 +1129,7 @@ def _run_batch_parallel(to_fix: list[dict], args, work_dir: str, workers: int) -
             print(f"\n{chr(9552) * 60}")
             print("Marking resolved threads \u2026")
             print(f"{chr(9552) * 60}\n")
-            for comment in applied_threads:
+            for comment in _expand_groups(applied_threads):
                 thread_id = comment["thread_id"]
                 print(f"  Thread {thread_id}: marking as fixed \u2026", end=" ")
                 try:
@@ -1170,8 +1255,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         default=os.environ.get("MODE") or None,
-        choices=["interactive", "batch"],
-        help="Processing mode: 'interactive' or 'batch'. Skips the mode prompt when set. Or set MODE in .env.",
+        choices=["interactive", "batch", "grouped"],
+        help="Processing mode: 'interactive', 'batch', or 'grouped' (like batch, but all comments on the "
+             "same file are sent in one prompt). Skips the mode prompt when set. Or set MODE in .env.",
     )
 
     return parser
@@ -1424,6 +1510,7 @@ def main() -> None:
             "How would you like to process the comments?",
             choices=[
                 questionary.Choice("Batch       — review all comments first, then fix them all at once", value="batch"),
+                questionary.Choice("Grouped     — like batch, but one prompt per file with all its comments", value="grouped"),
                 questionary.Choice("Interactive — apply each fix immediately after you approve it", value="interactive"),
             ],
         ).ask()
@@ -1570,15 +1657,23 @@ def main() -> None:
             to_fix.append(comment)
             print(f"Queued for {args.agent_impl.display_name}.\n")
 
-    # ---- Phase 2: Send all queued comments to the selected agent (batch mode only) ----
-    if mode == "batch":
+    # ---- Phase 2: Send all queued comments to the selected agent (batch / grouped modes) ----
+    if mode in ("batch", "grouped"):
         if not to_fix:
             if not aborted:
                 print(f"\nNo comments queued for {args.agent_impl.display_name}.")
             return
 
         print(f"\n{'═' * 60}")
-        print(f"Sending {len(to_fix)} queued comment(s) to {args.agent_impl.display_name} …")
+        if mode == "grouped":
+            queued = len(to_fix)
+            to_fix = _group_comments_by_file(to_fix)
+            print(
+                f"Sending {queued} queued comment(s) to {args.agent_impl.display_name} "
+                f"as {len(to_fix)} prompt(s), grouped by file …"
+            )
+        else:
+            print(f"Sending {len(to_fix)} queued comment(s) to {args.agent_impl.display_name} …")
         print(f"{'═' * 60}\n")
 
         if args.workers > 1:
